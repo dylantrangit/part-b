@@ -6,6 +6,7 @@ from referee.game import (
     EatAction,
     CascadeAction,
     CellState,
+    CARDINAL_DIRECTIONS,
 )
 
 from .state import GameState
@@ -48,7 +49,7 @@ def is_valid_placement(state, coord):
 def is_adjacent_to_opponent(state, coord):
     opponent = state.get_opponent()
 
-    for direction in Direction:
+    for direction in CARDINAL_DIRECTIONS:
         try:
             next_coord = coord + direction
         except ValueError:
@@ -65,7 +66,69 @@ def is_adjacent_to_opponent(state, coord):
 
 
 def generate_play_actions(state):
-    # can jsut reuse the part a code i think like move, eat, cascade
+    actions = []
+    player = state.player_to_move
+
+    # go through the cells, skip if wrong color
+    for coord, cell in state.board.items():
+        if cell.color != player:
+            continue
+
+        for direction in CARDINAL_DIRECTIONS:
+            if can_move(state, coord, direction):
+                actions.append(MoveAction(coord, direction))
+
+            elif can_eat(state, coord, direction):
+                actions.append(EatAction(coord, direction))
+
+            if can_cascade(state, coord, direction):
+                actions.append(CascadeAction(coord, direction))
+
+    return actions
+
+
+def can_move(state, coord, direction):
+    from_cell = state.board.get(coord, CellState())
+
+    if from_cell.color != state.player_to_move:
+        return False
+
+    try:
+        target_coord = coord + direction
+    except ValueError:
+        return False
+
+    target_cell = state.board.get(target_coord, CellState())
+
+    if target_cell.is_empty or target_cell.color == state.player_to_move:
+        return True
+
+    return False
+
+
+def can_eat(state, coord, direction):
+    from_cell = state.board.get(coord, CellState())
+
+    if from_cell.color != state.player_to_move:
+        return False
+
+    try:
+        target_coord = coord + direction
+    except ValueError:
+        return False
+
+    target_cell = state.board.get(target_coord, CellState())
+
+    if (
+        target_cell.color == state.get_opponent()
+        and from_cell.height >= target_cell.height
+    ):
+        return True
+
+    return False
+
+
+def can_cascade(state, coord, direction):
     pass
 
 
