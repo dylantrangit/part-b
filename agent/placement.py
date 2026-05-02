@@ -1,6 +1,7 @@
+import traceback
 from math import inf
 
-from referee.game import Coord, PlaceAction, PlayerColor
+from referee.game import PlayerColor
 
 from .eval import evaluate
 
@@ -10,19 +11,22 @@ SPREAD_PENALTY = 6
 THREAT_BONUS = 10
 
 
-RED_BOOK = {
-    0: Coord(3, 3),
-    2: Coord(4, 4),
-    4: Coord(3, 6),
-    6: Coord(4, 1),
-}
-
-
 def choose_placement_action(state):
-    book_action = get_book_action(state)
-    if book_action is not None:
-        return book_action
+    try:
+        best_action = _search_best_placement(state)
+    except Exception:
+        traceback.print_exc()
+        best_action = None
 
+    if best_action is not None:
+        return best_action
+
+    for action in state.legal_actions():
+        return action
+    return None
+
+
+def _search_best_placement(state):
     actions = list(state.legal_actions())
     if not actions:
         return None
@@ -35,10 +39,11 @@ def choose_placement_action(state):
     beta = inf
 
     for action in order_place_actions(state, actions):
-        child = state.copy()
-        child.apply(action)
-
-        score = placement_search(child, depth=1, alpha=alpha, beta=beta)
+        state.apply(action)
+        try:
+            score = placement_search(state, depth=1, alpha=alpha, beta=beta)
+        finally:
+            state.undo()
 
         if maximizing:
             if score > best_score:
@@ -67,10 +72,11 @@ def placement_search(state, depth, alpha, beta):
     if maximizing:
         value = -inf
         for action in order_place_actions(state, actions):
-            child = state.copy()
-            child.apply(action)
-
-            value = max(value, placement_search(child, depth - 1, alpha, beta))
+            state.apply(action)
+            try:
+                value = max(value, placement_search(state, depth - 1, alpha, beta))
+            finally:
+                state.undo()
             alpha = max(alpha, value)
             if alpha >= beta:
                 break
@@ -78,10 +84,11 @@ def placement_search(state, depth, alpha, beta):
 
     value = inf
     for action in order_place_actions(state, actions):
-        child = state.copy()
-        child.apply(action)
-
-        value = min(value, placement_search(child, depth - 1, alpha, beta))
+        state.apply(action)
+        try:
+            value = min(value, placement_search(state, depth - 1, alpha, beta))
+        finally:
+            state.undo()
         beta = min(beta, value)
         if alpha >= beta:
             break
@@ -155,19 +162,6 @@ def order_place_actions(state, actions):
     return [action for _, action in scored]
 
 
-def get_book_action(state):
-    if state.turn_color != PlayerColor.RED:
-        return None
-
-    coord = RED_BOOK.get(state.placement_count)
-    if coord is None:
-        return None
-
-    for action in state.legal_actions():
-        if isinstance(action, PlaceAction) and action.coord == coord:
-            return action
-
-    return None
 # from math import inf
 
 # from referee.game import Coord, PlaceAction, PlayerColor
