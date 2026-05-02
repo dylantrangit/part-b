@@ -40,6 +40,8 @@ class GameState:
         self.play_history = {}
         self.undo_stack = []
 
+        self._current_undo_record = None
+
     def get_phase(self):
         return "placement" if self.placement_count < 8 else "play"
 
@@ -115,6 +117,11 @@ class GameState:
 
         flat_idx = self.flat_index(coord)
 
+        if self._current_undo_record is not None:
+            cells = self._current_undo_record["cells"]
+            if flat_idx not in cells:
+                cells[flat_idx] = old_value
+
         old_colour = None
         if old_value > 0:
             old_colour = PlayerColor.RED
@@ -163,6 +170,8 @@ class GameState:
             return
         key = int(self.zobrist_hash)
         self.play_history[key] = self.play_history.get(key, 0) + 1
+        if self._current_undo_record is not None:
+            self._current_undo_record["history_key"] = key
 
     def unrecord_play_history(self):
         if self.get_phase() != "play":
@@ -185,6 +194,9 @@ class GameState:
 
     def apply(self, action):
         apply_action(self, action)
+
+    def undo(self):
+        undo_action(self)
 
     def terminal(self, ply=0):
         if self.red_tokens == 0:
@@ -275,7 +287,9 @@ def is_adjacent_to_opponent(state, coord):
 
 
 def generate_play_actions(state):
-    for flat_idx in state.current_piece_list():
+    # Snapshot the piece list — callers commonly iterate this generator
+    # while applying/undoing actions, which mutates the underlying list.
+    for flat_idx in list(state.current_piece_list()):
         coord = state.coord_from_flat(flat_idx)
         height = state.get_height(coord)
 
@@ -310,16 +324,54 @@ def has_any_legal_action(state):
 
 
 def apply_action(state, action):
-    if isinstance(action, PlaceAction):
-        _apply_place(state, action)
-    elif isinstance(action, MoveAction):
-        _apply_move(state, action)
-    elif isinstance(action, EatAction):
-        _apply_eat(state, action)
-    elif isinstance(action, CascadeAction):
-        _apply_cascade(state, action)
-    else:
-        raise ValueError(f"Unknown action: {action}")
+    record = {
+        "cells": {},
+        "turn_color": state.turn_color,
+        "placement_count": state.placement_count,
+        "play_ply": state.play_ply,
+        "history_key": None,
+    }
+    state._current_undo_record = record
+    try:
+        if isinstance(action, PlaceAction):
+            _apply_place(state, action)
+        elif isinstance(action, MoveAction):
+            _apply_move(state, action)
+        elif isinstance(action, EatAction):
+            _apply_eat(state, action)
+        elif isinstance(action, CascadeAction):
+            _apply_cascade(state, action)
+        else:
+            raise ValueError(f"Unknown action: {action}")
+    finally:
+        state._current_undo_record = None
+    state.undo_stack.append(record)
+
+
+def undo_action(state):
+    record = state.undo_stack.pop()
+
+    history_key = record["history_key"]
+    if history_key is not None:
+        count = state.play_history.get(history_key, 0)
+        if count <= 1:
+            state.play_history.pop(history_key, None)
+        else:
+            state.play_history[history_key] = count - 1
+
+    # Restore touched cells. set_cell handles piece-list bookkeeping, scalar
+    # token/stack counts, and per-cell zobrist XORs; recording is off here
+    # so the undo doesn't push onto the (already-popped) record.
+    for flat_idx, old_value in record["cells"].items():
+        coord = state.coord_from_flat(flat_idx)
+        state.set_cell(coord, old_value)
+
+    if state.turn_color != record["turn_color"]:
+        state.zobrist_hash ^= SIDE_TO_MOVE_KEY
+        state.turn_color = record["turn_color"]
+
+    state.placement_count = record["placement_count"]
+    state.play_ply = record["play_ply"]
 
 
 def _apply_place(state, action):

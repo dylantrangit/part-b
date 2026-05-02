@@ -19,12 +19,11 @@ def negamax_fixed(board, depth, alpha, beta, ply=0):
     best_move = None
     best_val = -inf
 
-    for move in board.legal_actions():
-        child = board.copy()
-        child.apply(move)
-
-        val, _ = negamax_fixed(child, depth - 1, -beta, -alpha, ply + 1)
+    for move in list(board.legal_actions()):
+        board.apply(move)
+        val, _ = negamax_fixed(board, depth - 1, -beta, -alpha, ply + 1)
         val = -val
+        board.undo()
 
         if val > best_val:
             best_val = val
