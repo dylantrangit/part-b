@@ -3,3 +3,4 @@ __pycache__/
 *.md
 !**/assignment_spec.md
 !**/README.md
+!**/implementation_plan.md
