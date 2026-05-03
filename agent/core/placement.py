@@ -1,7 +1,7 @@
 import traceback
 from math import inf
 
-from referee.game import PlayerColor
+from referee.game import Coord, PlayerColor
 
 from .eval import evaluate
 

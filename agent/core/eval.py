@@ -11,6 +11,10 @@ MOBILITY_WEIGHT = 2
 CASCADE_REACH_WEIGHT = 5
 CENTRE_WEIGHT = 1
 TEMPO_WEIGHT = 1
+REPETITION_AVOID_WEIGHT = 50
+ENDGAME_EMPHASIS_WEIGHT = 50
+ENDGAME_RAMP_PLY = 280
+ENDGAME_RAMP_LEN = 20
 
 
 _DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
@@ -28,6 +32,8 @@ def evaluate(state):
     score += CASCADE_REACH_WEIGHT * cascade_reach_diff(state)
     score += CENTRE_WEIGHT * centre_diff(state)
     score += TEMPO_WEIGHT * tempo(state)
+    score += REPETITION_AVOID_WEIGHT * repetition_avoidance(state)
+    score += ENDGAME_EMPHASIS_WEIGHT * endgame_emphasis(state)
     return score
 
 
@@ -211,3 +217,27 @@ def centre_diff(state):
 
 def tempo(state):
     return 1 if state.turn_color == PlayerColor.RED else -1
+
+
+def repetition_avoidance(state):
+    # Penalise positions whose hash already appears in the play history. The
+    # side leading on tokens loses (heads to a draw), so eval is reduced from
+    # red's perspective when red is ahead and increased when blue is ahead.
+    count = state.play_history.get(int(state.zobrist_hash), 0)
+    if count == 0:
+        return 0
+    diff = state.red_tokens - state.blue_tokens
+    if diff > 0:
+        return -count
+    if diff < 0:
+        return count
+    return 0
+
+
+def endgame_emphasis(state):
+    # Past play_ply 280 the 300-turn timer makes raw token count decisive.
+    # Linearly ramp an extra token-diff bonus to 1.0 at ply 300.
+    if state.play_ply <= ENDGAME_RAMP_PLY:
+        return 0.0
+    boost = min(1.0, (state.play_ply - ENDGAME_RAMP_PLY) / ENDGAME_RAMP_LEN)
+    return boost * (state.red_tokens - state.blue_tokens)

@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 *.md
+!**/assignment_spec.md
+!**/README.md

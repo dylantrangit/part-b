@@ -1,6 +1,9 @@
+# Iteration 1 search: fixed-depth negamax alpha-beta. No iterative deepening,
+# no transposition table, no move ordering.
+
 from math import inf
 
-from .eval import evaluate
+from ..core.eval import evaluate
 
 
 def signed_eval(board):
