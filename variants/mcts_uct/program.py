@@ -2,6 +2,7 @@ from referee.game import PlayerColor, Action
 
 from agent.core.board import GameState
 from agent.core.placement import choose_placement_action
+from agent.core.time_budget import TimeBudget, per_move_budget
 from agent.search.mcts_uct import mcts
 
 
@@ -20,7 +21,16 @@ class Agent:
                 raise ValueError("No legal placement action found")
             return move
 
-        move = mcts(self.state, time_limit_s=0.95)
+        time_remaining = referee.get("time_remaining")
+        if time_remaining is None:
+            time_remaining = 60.0
+
+        plies_left = max(30, 300 - self.state.play_ply)
+        moves_left = max(1, plies_left // 2)
+        budget_seconds = per_move_budget(time_remaining, moves_left)
+        budget = TimeBudget(budget_seconds)
+
+        move = mcts(self.state, budget)
 
         if move is None:
             for action in self.state.legal_actions():
