@@ -20,11 +20,14 @@ from referee.game import EatAction, CascadeAction, MoveAction, PlayerColor
 from .board import DIR_TO_DR_DC
 
 
-# Softer temperature than the original 1.0: the score range (~0..7 for EAT)
-# made the original softmax effectively greedy, collapsing rollout diversity.
-# Higher τ broadens the sampling distribution so MCTS sees a richer set of
-# futures from each leaf.
-_SOFTMAX_TEMP = 2.0
+# Two-temperature setup (Tier 2.5):
+# - τ_rollout (broader): preserves playout diversity so MCTS sees varied
+#   futures from each leaf. The original 1.0 was too greedy (F3 fix).
+# - τ_prior (sharper): peakier PUCT priors concentrate visits on plausible
+#   moves earlier — the diagnostic showed opening Q-noise dominates with
+#   only ~15 sims/child, so sharper priors directly help PUCT focus.
+_SOFTMAX_TEMP = 2.0  # τ_rollout — used in _sample_softmax
+_TAU_PRIOR = 1.0     # used by _materialise_actions in mcts_heavy
 
 
 def rollout_policy_action(state, cached_actions=None, cached_priors=None):
@@ -156,24 +159,47 @@ def heuristic_score(state, action):
     if isinstance(action, EatAction):
         sr, sc = action.coord.r, action.coord.c
         dr, dc = DIR_TO_DR_DC[action.direction]
-        target_h = abs(int(grid[sr + dr, sc + dc]))
+        tr, tc = sr + dr, sc + dc
+        target_h = abs(int(grid[tr, tc]))
         attacker_h = abs(int(grid[sr, sc]))
-        # MVV-LVA: prefer eating big enemies with small attackers.
-        return 3.0 + target_h - 0.1 * attacker_h
+        # MVV-LVA base: prefer eating big enemies with small attackers.
+        score = 3.0 + target_h - 0.1 * attacker_h
+        # Tier 3.3: post-move safety. After the EAT, the attacker sits at
+        # (tr, tc) at its original height. If an enemy adjacent to (tr, tc)
+        # has h_enemy >= attacker_h, opponent recaptures next turn for free.
+        # Diagnostic showed Red-side fast tactical losses are exactly this
+        # pattern (greedy EAT → free recapture).
+        for ddr, ddc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ar, ac = tr + ddr, tc + ddc
+            if not (0 <= ar < 8 and 0 <= ac < 8):
+                continue
+            adj = int(grid[ar, ac])
+            if adj == 0:
+                continue
+            # The just-eaten square's pre-move adjacency: skip the source we
+            # came from since after EAT it'll be empty (we left it).
+            if (ar, ac) == (sr, sc):
+                continue
+            if ((adj < 0) if is_red else (adj > 0)) and abs(adj) >= attacker_h:
+                score -= 0.8
+                break
+        return score
     if isinstance(action, CascadeAction):
         sr, sc = action.coord.r, action.coord.c
         h = abs(int(grid[sr, sc]))
         dr, dc = DIR_TO_DR_DC[action.direction]
-        enemy_mass, friendly_mass, fell_off = _cascade_quality(
+        enemy_mass, enemy_off_board, friendly_mass, fell_off = _cascade_quality(
             grid, sr, sc, h, dr, dc, is_red
         )
         # Cascading converts a height-h stack into h height-1 tokens.
         # Productive only when enough enemy mass is hit to offset the loss
         # of structure. The trailing -0.3 (F7) is an extra flat down-weight
-        # so cascades have to clear a bar before competing with MOVE/EAT —
-        # MOVE/EAT outcomes are much more deterministic for a rollout.
+        # so cascades have to clear a bar before competing with MOVE/EAT.
+        # Tier 3.4: extra bonus when an enemy is pushed off the edge —
+        # eliminated tokens are strictly better than relocated ones.
         return (
-            0.6 * enemy_mass         # productive: push enemies (incl. off-board)
+            0.6 * enemy_mass         # productive: push enemies (relocate or off)
+            + 0.4 * enemy_off_board  # bonus: pushed-off enemies are eliminated
             - 0.3 * h                # structural cost: tall stack → singletons
             - 0.4 * friendly_mass    # disrupting own pieces in the path
             - 0.5 * fell_off         # own cascading tokens lost off the edge
@@ -190,13 +216,20 @@ def heuristic_score(state, action):
 
 
 def _cascade_quality(grid, sr, sc, h, dr, dc, is_red):
-    """Walk the cascade ray; return (enemy_mass, friendly_mass, fell_off).
+    """Walk the cascade ray; return (enemy_mass, enemy_off_board, friendly_mass, fell_off).
 
     `enemy_mass` and `friendly_mass` sum the heights of stacks the cascading
-    tokens would push (per the spec, pushed not merged). `fell_off` counts
-    cascade-token positions past the board edge — those tokens are lost.
+    tokens would push (per the spec, pushed not merged). `enemy_off_board`
+    is the subset of enemy mass whose one-step push lands off the board
+    (eliminated). `fell_off` counts cascade-token positions past the board
+    edge — those own tokens are lost.
+
+    The off-board check is approximate: only one-step pushes are simulated
+    so chain-pushes that drive an enemy off via multiple relocations aren't
+    detected. Acceptable for a rollout heuristic.
     """
     enemy_mass = 0
+    enemy_off_board = 0
     friendly_mass = 0
     fell_off = 0
     cr, cc = sr, sc
@@ -212,19 +245,28 @@ def _cascade_quality(grid, sr, sc, h, dr, dc, is_red):
         target_h = abs(v)
         if (v < 0) if is_red else (v > 0):
             enemy_mass += target_h
+            # If the push destination is off-board, this enemy is eliminated.
+            push_r, push_c = cr + dr, cc + dc
+            if not (0 <= push_r < 8 and 0 <= push_c < 8):
+                enemy_off_board += target_h
         else:
             friendly_mass += target_h
-    return enemy_mass, friendly_mass, fell_off
+    return enemy_mass, enemy_off_board, friendly_mass, fell_off
 
 
 def _move_score(grid, sr, sc, nr, nc, is_red):
     """Heuristic for a MOVE: centre tiebreak + merge bonus + threat relief +
-    threat creation. Computed in one neighbour walk per (source, dest)."""
+    threat creation + edge penalty. One neighbour walk per (source, dest)."""
     h = abs(int(grid[sr, sc]))
     dest_v = int(grid[nr, nc])
 
     # Centre proximity as a small tiebreaker; range ~0..0.7.
     score = 0.1 * (7 - abs(nr - 3.5) - abs(nc - 3.5))
+
+    # Tier 3.5: explicit penalty for moving onto an edge cell — pieces
+    # there have ≤3 escape directions and are easier to corner.
+    if nr == 0 or nr == 7 or nc == 0 or nc == 7:
+        score -= 0.3
 
     # Merge: dest holds a friendly stack — consolidate. Larger merge target
     # → bigger gain (single tall stack is harder to eat).

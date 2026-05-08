@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 from referee.game import Action
 
 from ..core.eval import evaluate
-from ..core.policy import heuristic_score, rollout_policy_action
+from ..core.policy import (
+    _SOFTMAX_TEMP as _TAU_ROLLOUT,
+    _TAU_PRIOR,
+    heuristic_score,
+    rollout_policy_action,
+)
 from ..core.time_budget import TimeBudget
 
 
@@ -51,10 +56,15 @@ class Node:
     prior: float = 0.0
     children: dict[Action, "Node"] = field(default_factory=dict)
     untried: list[Action] | None = None
-    # Softmax-normalised priors aligned with `untried`, sorted ascending so
-    # `pop()` gives the highest-prior action first (PUCT-style expansion
-    # ordering). Reused as cached weights for the rollout's first softmax.
+    # Softmax-normalised priors at τ_prior, aligned with `untried` and
+    # sorted ascending so `pop()` returns the highest-prior action first.
+    # Used as PUCT priors for selection.
     untried_priors: list[float] | None = None
+    # Softmax weights at τ_rollout, also aligned with `untried`. Passed to
+    # `heavy_rollout` for sampling the first rollout step. Stored separately
+    # because τ_prior < τ_rollout — we want sharp priors for PUCT but
+    # broad sampling for rollout diversity.
+    untried_rollout_weights: list[float] | None = None
     visits: int = 0
     total_value: float = 0.0
     rave_visits: int = 0
@@ -146,32 +156,34 @@ def select(root: Node, board, c: float):
 
 
 def _materialise_actions(node: Node, board) -> None:
-    """Populate `node.untried` and `node.untried_priors` from `board`.
+    """Populate untried + priors (τ_prior) + rollout weights (τ_rollout).
 
-    Computes a heuristic score per action, applies softmax to get priors
-    summing to 1, then sorts by raw score so `pop()` returns the highest-
-    prior action first. The priors are reused both as PUCT weights for
-    selection AND as direct sampling weights for the rollout's first step.
+    Computes one heuristic score per legal action, then turns it into two
+    aligned lists: sharp priors for PUCT selection (τ_prior) and broader
+    weights for rollout sampling (τ_rollout). Sorted ascending by raw
+    score so `pop()` returns the highest-prior action first.
     """
     actions = list(board.legal_actions())
     if not actions:
         node.untried = []
         node.untried_priors = []
+        node.untried_rollout_weights = []
         return
     scores = [heuristic_score(board, a) for a in actions]
     max_s = max(scores)
-    weights = [math.exp((s - max_s) / 2.0) for s in scores]  # τ matches policy
-    total = sum(weights)
+    prior_weights = [math.exp((s - max_s) / _TAU_PRIOR) for s in scores]
+    total = sum(prior_weights)
     if total <= 0.0:
-        # Degenerate (shouldn't happen with finite scores) — uniform prior.
         priors = [1.0 / len(actions)] * len(actions)
     else:
-        priors = [w / total for w in weights]
+        priors = [w / total for w in prior_weights]
+    rollout_weights = [math.exp((s - max_s) / _TAU_ROLLOUT) for s in scores]
     # Sort ascending by raw score so .pop() (LIFO) returns the highest-
-    # prior action — front-loads expansion onto plausible moves.
+    # prior action first — front-loads expansion onto plausible moves.
     order = sorted(range(len(actions)), key=lambda i: scores[i])
     node.untried = [actions[i] for i in order]
     node.untried_priors = [priors[i] for i in order]
+    node.untried_rollout_weights = [rollout_weights[i] for i in order]
 
 
 def expand(node: Node, board, ply: int, sim_actions: list):
@@ -188,6 +200,8 @@ def expand(node: Node, board, ply: int, sim_actions: list):
 
     move = node.untried.pop()
     prior = node.untried_priors.pop() if node.untried_priors else 0.0
+    if node.untried_rollout_weights is not None:
+        node.untried_rollout_weights.pop()
     sim_actions.append((board.turn_color.name, move))
     board.apply(move)
     child = Node(parent=node, incoming_move=move, prior=prior)
@@ -264,14 +278,25 @@ def backprop(leaf: Node, reward: float, sim_actions: list, applied_count: int) -
 
 
 def best_child(root: Node) -> Node | None:
+    """Robust child with a visit-cluster Q tiebreak (Tier 2.4).
+
+    Standard MCTS picks max-visits, ties broken by Q. The diagnostic showed
+    4/20 root decisions where the most-visited child had a *strictly worse*
+    Q than another sibling whose visit count was within a few percent —
+    PUCT explored a high-prior child more without that prior translating
+    to better Q. So: among children whose visit count is within 10 % of
+    the max, pick the one with the highest Q. This keeps the robustness
+    of the visit-count rule (avoid one-shot lucky rollouts) while letting
+    Q break statistically-tied visit counts.
+    """
     if not root.children:
         return None
+    max_v = max(c.visits for c in root.children.values())
+    threshold = max(1, max_v * 0.9)
+    cluster = [c for c in root.children.values() if c.visits >= threshold]
     return max(
-        root.children.values(),
-        key=lambda child: (
-            child.visits,
-            (child.total_value / child.visits) if child.visits > 0 else -math.inf,
-        ),
+        cluster,
+        key=lambda c: (c.total_value / c.visits) if c.visits > 0 else -math.inf,
     )
 
 
@@ -305,7 +330,9 @@ def mcts(
                 sim_actions,
                 rollout_depth_cap,
                 leaf_actions=node.untried,
-                leaf_priors=node.untried_priors,
+                # Rollout uses τ_rollout-temperature weights for sampling
+                # diversity, not the τ_prior priors used by PUCT.
+                leaf_priors=node.untried_rollout_weights,
             )
 
         backprop(node, reward, sim_actions, applied_count)
