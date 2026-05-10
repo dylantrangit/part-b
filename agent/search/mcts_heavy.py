@@ -21,7 +21,7 @@ import math
 import random
 from dataclasses import dataclass, field
 
-from referee.game import Action
+from referee.game import Action, PlayerColor
 
 from ..core.eval import evaluate
 from ..core.policy import (
@@ -36,15 +36,26 @@ from ..core.time_budget import TimeBudget
 _RAVE_BIAS = 1e-5
 _FPU_REDUCTION = 0.25
 _EVAL_SCALE = 500.0
-# Shorter rollouts than the original 25 so we (a) do more iterations per
-# unit time and (b) lean more on the calibrated `evaluate()` cutoff than on
-# the noisy rollout heuristic. Plan §9.1 picked 25 conservatively; 15 keeps
-# enough lookahead for tactical sequences without compounding heuristic noise.
+# Shorter rollouts so we (a) do more iterations per unit time and (b) lean
+# more on the calibrated `evaluate()` cutoff than on the noisy rollout
+# heuristic. 15 keeps enough lookahead for tactical sequences without
+# compounding heuristic noise.
 _ROLLOUT_DEPTH_CAP = 15
-# PUCT exploration constant. Plan §10.1(b) suggests 1.5–2.5; 2.0 is the
-# AlphaZero default and gives a sensible balance between Q-exploitation and
-# prior-guided exploration in the 30–80 branching factor of Cascade midgame.
+# PUCT exploration constant. The AlphaZero default (2.0) gives a sensible
+# balance between Q-exploitation and prior-guided exploration at the 30–80
+# branching factor of Cascade midgame.
 _C_PUCT = 2.0
+# Endgame boost: from this ply onward the rollout-cutoff eval starts
+# leaning on raw token count more heavily, ramped to full strength at
+# ENDGAME_FULL_PLY. Avoids drifting into turn-limit losses where I3's
+# tactical depth wins on token diff.
+_ENDGAME_BOOST_START_PLY = 200
+_ENDGAME_BOOST_FULL_PLY = 280
+_ENDGAME_BOOST_TOKEN_WEIGHT = 100.0
+# Stalling penalty applied to root priors when we're ahead on tokens and
+# a candidate move's apply state is already in play_history (i.e. heading
+# toward 3-fold). Subtracted from the heuristic score before softmax.
+_STALLING_PENALTY = 1.0
 
 
 @dataclass
@@ -90,6 +101,14 @@ def _terminal_value_for(board, ply: int, perspective: str) -> float | None:
 
 def _eval_value_for(board, perspective: str) -> float:
     raw = evaluate(board)
+    # Endgame boost: bias the rollout-cutoff signal toward token-diff as the
+    # 300-turn limit approaches. The shared `evaluate()` already has a small
+    # endgame_emphasis term (kicks in at ply 280); this is an MCTS-only
+    # extra so it doesn't leak into PVS and benefit I3 too.
+    if board.play_ply >= _ENDGAME_BOOST_START_PLY:
+        boost_span = _ENDGAME_BOOST_FULL_PLY - _ENDGAME_BOOST_START_PLY
+        ramp = min(1.0, (board.play_ply - _ENDGAME_BOOST_START_PLY) / boost_span)
+        raw += ramp * _ENDGAME_BOOST_TOKEN_WEIGHT * (board.red_tokens - board.blue_tokens)
     if perspective == "BLUE":
         raw = -raw
     return math.tanh(raw / _EVAL_SCALE)
@@ -98,9 +117,9 @@ def _eval_value_for(board, perspective: str) -> float:
 def _selection_score(child: Node, parent: Node, c_puct: float) -> float:
     """PUCT score: Q(child) + c_puct · P(child) · √N_parent / (1 + n_child).
 
-    Replaces UCB1 for I5: the heuristic prior breaks UCB1's "every child
-    gets explored uniformly first" pattern, which is what was burning all
-    the budget on plausibly-terrible openings (cf. the F1–F4 diagnostic).
+    The heuristic prior breaks UCB1's "every child gets explored uniformly
+    first" pattern, which otherwise burns budget on plausibly-terrible
+    openings before exploring promising lines.
     """
     n = child.visits
     if n == 0:
@@ -155,21 +174,23 @@ def select(root: Node, board, c: float):
         node = chosen
 
 
-def _materialise_actions(node: Node, board) -> None:
-    """Populate untried + priors (τ_prior) + rollout weights (τ_rollout).
+def _materialise_with_actions(node: Node, board, actions, score_offsets=None) -> None:
+    """Populate node action lists from an explicit `actions` list.
 
-    Computes one heuristic score per legal action, then turns it into two
-    aligned lists: sharp priors for PUCT selection (τ_prior) and broader
-    weights for rollout sampling (τ_rollout). Sorted ascending by raw
-    score so `pop()` returns the highest-prior action first.
+    Used both by the standard `_materialise_actions` (full legal list) and
+    by `mcts()` to set up the root with a curated subset (filter
+    decisive-loss moves, prune clearly-bad moves). `score_offsets`, if
+    provided, are added to the heuristic scores before softmax — used at
+    the root to demote stalling moves when we're ahead on tokens.
     """
-    actions = list(board.legal_actions())
     if not actions:
         node.untried = []
         node.untried_priors = []
         node.untried_rollout_weights = []
         return
     scores = [heuristic_score(board, a) for a in actions]
+    if score_offsets is not None:
+        scores = [s + o for s, o in zip(scores, score_offsets)]
     max_s = max(scores)
     prior_weights = [math.exp((s - max_s) / _TAU_PRIOR) for s in scores]
     total = sum(prior_weights)
@@ -184,6 +205,93 @@ def _materialise_actions(node: Node, board) -> None:
     node.untried = [actions[i] for i in order]
     node.untried_priors = [priors[i] for i in order]
     node.untried_rollout_weights = [rollout_weights[i] for i in order]
+
+
+def _materialise_actions(node: Node, board) -> None:
+    """Populate untried + priors (τ_prior) + rollout weights (τ_rollout)
+    for an internal-tree node, using the full legal-action list.
+    """
+    _materialise_with_actions(node, board, list(board.legal_actions()))
+
+
+def _find_root_immediate_win(state, actions, is_red):
+    """Return any action that drops opponent tokens to 0, or None."""
+    enemy_attr = "blue_tokens" if is_red else "red_tokens"
+    for action in actions:
+        state.apply(action)
+        won = getattr(state, enemy_attr) == 0
+        state.undo()
+        if won:
+            return action
+    return None
+
+
+def _filter_root_safe_actions(state, actions, is_red):
+    """Drop actions that let the opponent win on their next turn.
+
+    Gated on us being in elimination range (own_stacks ≤ 2 or own_tokens ≤ 5)
+    so the O(N²) apply/undo scan stays out of unthreatened mid-game positions.
+    Returns the full list when not in range or when every move is losing
+    (MCTS will then pick the least-bad option as before).
+    """
+    own_stacks = state.red_stacks if is_red else state.blue_stacks
+    own_tokens = state.red_tokens if is_red else state.blue_tokens
+    if own_stacks > 2 and own_tokens > 5:
+        return actions
+
+    own_attr = "red_tokens" if is_red else "blue_tokens"
+    safe = []
+    for action in actions:
+        state.apply(action)
+        opp_can_win = False
+        for opp_action in state.legal_actions():
+            state.apply(opp_action)
+            opp_won = getattr(state, own_attr) == 0
+            state.undo()
+            if opp_won:
+                opp_can_win = True
+                break
+        state.undo()
+        if not opp_can_win:
+            safe.append(action)
+    return safe if safe else actions
+
+
+def _stalling_penalties(state, actions, is_red):
+    """Return one penalty per action that demotes 3-fold-stalling moves.
+
+    Only fires when we're ahead on tokens — a draw by repetition would lose
+    that material lead. A move whose apply state is already in play_history
+    counts as a stalling move (one more visit gets us closer to 3-fold).
+    """
+    own_tokens = state.red_tokens if is_red else state.blue_tokens
+    enemy_tokens = state.blue_tokens if is_red else state.red_tokens
+    if own_tokens <= enemy_tokens:
+        return [0.0] * len(actions)
+
+    penalties = []
+    for action in actions:
+        state.apply(action)
+        already_seen = state.play_history.get(int(state.zobrist_hash), 0) >= 1
+        state.undo()
+        penalties.append(-_STALLING_PENALTY if already_seen else 0.0)
+    return penalties
+
+
+def _pruned_actions(state, actions, threshold=-0.5, min_keep=2):
+    """Drop clearly-bad actions (heuristic score < threshold).
+
+    Reduces effective branching at the root so each remaining child gets
+    proportionally more sims — opening Q estimates are noise-limited at
+    ~15 sims/child.
+    """
+    if len(actions) <= min_keep + 2:
+        return actions
+    scored = [(a, heuristic_score(state, a)) for a in actions]
+    kept = [a for a, s in scored if s >= threshold]
+    if len(kept) < min_keep:
+        return actions
+    return kept
 
 
 def expand(node: Node, board, ply: int, sim_actions: list):
@@ -278,16 +386,15 @@ def backprop(leaf: Node, reward: float, sim_actions: list, applied_count: int) -
 
 
 def best_child(root: Node) -> Node | None:
-    """Robust child with a visit-cluster Q tiebreak (Tier 2.4).
+    """Robust child with a visit-cluster Q tiebreak.
 
-    Standard MCTS picks max-visits, ties broken by Q. The diagnostic showed
-    4/20 root decisions where the most-visited child had a *strictly worse*
-    Q than another sibling whose visit count was within a few percent —
-    PUCT explored a high-prior child more without that prior translating
-    to better Q. So: among children whose visit count is within 10 % of
-    the max, pick the one with the highest Q. This keeps the robustness
-    of the visit-count rule (avoid one-shot lucky rollouts) while letting
-    Q break statistically-tied visit counts.
+    Standard MCTS picks max-visits, ties broken by Q. But two children with
+    visits within a few percent are statistically tied, and PUCT can keep
+    exploring a high-prior child without that prior translating to better
+    Q. So: among children whose visit count is within 10 % of the max,
+    pick the one with the highest Q. Preserves the robustness of the
+    visit-count rule (avoid one-shot lucky rollouts) while letting Q
+    break statistically-tied visit counts.
     """
     if not root.children:
         return None
@@ -306,7 +413,33 @@ def mcts(
     c_puct: float = _C_PUCT,
     rollout_depth_cap: int = _ROLLOUT_DEPTH_CAP,
 ) -> Action | None:
+    legal = list(root_board.legal_actions())
+    if not legal:
+        return None
+
+    is_red = root_board.turn_color == PlayerColor.RED
+
+    # Short-circuit on a forced win — eliminates the opponent in one move.
+    # Avoids wasting MCTS budget when the answer is immediate.
+    win_move = _find_root_immediate_win(root_board, legal, is_red)
+    if win_move is not None:
+        return win_move
+
+    # Anti-decisive filter. Drop any move that leaves the opponent a winning
+    # response next turn, when we're vulnerable enough for that to happen.
+    actions_to_search = _filter_root_safe_actions(root_board, legal, is_red)
+
+    # Prune clearly-bad actions to reduce effective branching at the root,
+    # giving each remaining child more sims.
+    actions_to_search = _pruned_actions(root_board, actions_to_search)
+
+    # Stalling penalties: when ahead on tokens, demote moves whose post-
+    # apply state is already in play_history (they push toward 3-fold draw,
+    # which loses our material lead).
+    stalling = _stalling_penalties(root_board, actions_to_search, is_red)
+
     root = Node(parent=None, incoming_move=None)
+    _materialise_with_actions(root, root_board, actions_to_search, score_offsets=stalling)
 
     while not budget.expired():
         board = root_board
