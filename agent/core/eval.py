@@ -1,15 +1,15 @@
 from referee.game import PlayerColor
 
 
-# F6 hand-tune (vs original 100/20/15/-25/-40/30):
-# - STACK_DIFF halved: more stacks of the same total mass means each is
-#   shorter and easier to EAT — original +20 over-rewarded "spreading thin".
-# - WEIGHTED_HEIGHT doubled: captures stack concentration, the property
-#   STACK_DIFF was inverting. A height-3 stack is materially worth more
-#   than three height-1 tokens despite identical token count.
-# - THREATENED deepened: vulnerable pieces dominate Cascade tactics, and
-#   PVS sees this directly — bumping the magnitude lets the rollout-cutoff
-#   eval (used by I5) see it more clearly too.
+# Eval weights:
+# - STACK_DIFF kept low: more stacks of the same total mass means each is
+#   shorter and easier to EAT, so over-rewarding raw stack count would push
+#   us toward "spread thin" positions.
+# - WEIGHTED_HEIGHT high: captures stack concentration. A height-3 stack is
+#   materially worth more than three height-1 tokens despite identical
+#   token count.
+# - THREATENED deep: vulnerable pieces dominate Cascade tactics, and the
+#   magnitude needs to be visible at the rollout-cutoff eval used by MCTS.
 TOKEN_DIFF_WEIGHT = 100
 STACK_DIFF_WEIGHT = 10
 WEIGHTED_HEIGHT_WEIGHT = 30

@@ -66,8 +66,8 @@ def negamax_ab(board, depth, alpha, beta, ply, budget, tt):
         return (t if board.turn_color.name == "RED" else -t), None
 
     # Soft draw cutoff: stop the search chasing repetitions. The hard rule
-    # (count >= 3 = draw) is already in board.terminal(); this is the search
-    # heuristic from the plan.
+    # (count >= 3 = draw) is already in board.terminal(); this is a search
+    # heuristic to avoid wasting effort on repetition lines.
     if board.play_history.get(int(board.zobrist_hash), 0) >= 2:
         return 0, None
 

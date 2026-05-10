@@ -67,5 +67,4 @@ changes, check that:
 - Placement-phase positions are *not* recorded in `play_history` (per spec:
   threefold repetition only counts play-phase positions).
 
-`tests/` is where these invariants belong as automated checks (planned per
-`docs/implementation_plan.md` §11; not yet built).
+`tests/` is where these invariants belong as automated checks (not yet built).

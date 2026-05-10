@@ -20,12 +20,12 @@ from referee.game import EatAction, CascadeAction, MoveAction, PlayerColor
 from .board import DIR_TO_DR_DC
 
 
-# Two-temperature setup (Tier 2.5):
+# Two-temperature setup:
 # - τ_rollout (broader): preserves playout diversity so MCTS sees varied
-#   futures from each leaf. The original 1.0 was too greedy (F3 fix).
+#   futures from each leaf.
 # - τ_prior (sharper): peakier PUCT priors concentrate visits on plausible
-#   moves earlier — the diagnostic showed opening Q-noise dominates with
-#   only ~15 sims/child, so sharper priors directly help PUCT focus.
+#   moves earlier. Opening Q-noise dominates at ~15 sims/child, so sharper
+#   priors directly help PUCT focus.
 _SOFTMAX_TEMP = 2.0  # τ_rollout — used in _sample_softmax
 _TAU_PRIOR = 1.0     # used by _materialise_actions in mcts_heavy
 
@@ -164,11 +164,10 @@ def heuristic_score(state, action):
         attacker_h = abs(int(grid[sr, sc]))
         # MVV-LVA base: prefer eating big enemies with small attackers.
         score = 3.0 + target_h - 0.1 * attacker_h
-        # Tier 3.3: post-move safety. After the EAT, the attacker sits at
-        # (tr, tc) at its original height. If an enemy adjacent to (tr, tc)
-        # has h_enemy >= attacker_h, opponent recaptures next turn for free.
-        # Diagnostic showed Red-side fast tactical losses are exactly this
-        # pattern (greedy EAT → free recapture).
+        # 1-step EAT recapture. After the EAT, the attacker sits at (tr, tc)
+        # at its original height. If an enemy adjacent to (tr, tc) has
+        # h_enemy ≥ attacker_h, opponent recaptures next turn for free.
+        recaptured = False
         for ddr, ddc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             ar, ac = tr + ddr, tc + ddc
             if not (0 <= ar < 8 and 0 <= ac < 8):
@@ -176,13 +175,45 @@ def heuristic_score(state, action):
             adj = int(grid[ar, ac])
             if adj == 0:
                 continue
-            # The just-eaten square's pre-move adjacency: skip the source we
-            # came from since after EAT it'll be empty (we left it).
             if (ar, ac) == (sr, sc):
-                continue
+                continue  # source square is empty after the EAT
             if ((adj < 0) if is_red else (adj > 0)) and abs(adj) >= attacker_h:
                 score -= 0.8
+                recaptured = True
                 break
+
+        # CASCADE-elimination check. Even when no adjacent enemy can EAT us,
+        # an enemy CASCADE in the same row/column could push us off the
+        # board. Only fire when (tr, tc) is on a board edge — that's the
+        # necessary condition for a one-step push to land us off-edge.
+        if not recaptured and (tr == 0 or tr == 7 or tc == 0 or tc == 7):
+            cascade_trap = False
+            for ddr, ddc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                # Cascade direction (ddr, ddc) is a threat only if the cell
+                # one step in that direction is off-board (else the push is
+                # in-board, less catastrophic).
+                push_r, push_c = tr + ddr, tc + ddc
+                if 0 <= push_r < 8 and 0 <= push_c < 8:
+                    continue
+                # Walk the inverse direction looking for an enemy stack of
+                # height ≥ k at distance k — sufficient to reach (tr, tc).
+                for k in range(1, 8):
+                    er, ec = tr - k * ddr, tc - k * ddc
+                    if not (0 <= er < 8 and 0 <= ec < 8):
+                        break
+                    adj = int(grid[er, ec])
+                    if adj == 0:
+                        continue
+                    if (er, ec) == (sr, sc):
+                        continue  # source becomes empty after EAT
+                    is_enemy = (adj < 0) if is_red else (adj > 0)
+                    if is_enemy and abs(adj) >= k:
+                        cascade_trap = True
+                        break
+                if cascade_trap:
+                    break
+            if cascade_trap:
+                score -= 0.6
         return score
     if isinstance(action, CascadeAction):
         sr, sc = action.coord.r, action.coord.c
@@ -193,17 +224,17 @@ def heuristic_score(state, action):
         )
         # Cascading converts a height-h stack into h height-1 tokens.
         # Productive only when enough enemy mass is hit to offset the loss
-        # of structure. The trailing -0.3 (F7) is an extra flat down-weight
-        # so cascades have to clear a bar before competing with MOVE/EAT.
-        # Tier 3.4: extra bonus when an enemy is pushed off the edge —
-        # eliminated tokens are strictly better than relocated ones.
+        # of structure. The trailing flat -0.3 makes cascades clear a bar
+        # before competing with MOVE/EAT (whose outcomes are much more
+        # deterministic for a rollout). Extra bonus when an enemy is pushed
+        # off the edge — eliminated tokens beat relocated ones.
         return (
             0.6 * enemy_mass         # productive: push enemies (relocate or off)
             + 0.4 * enemy_off_board  # bonus: pushed-off enemies are eliminated
             - 0.3 * h                # structural cost: tall stack → singletons
             - 0.4 * friendly_mass    # disrupting own pieces in the path
             - 0.5 * fell_off         # own cascading tokens lost off the edge
-            - 0.3                    # F7: flat CASCADE bias
+            - 0.3                    # flat CASCADE bias
         )
     if isinstance(action, MoveAction):
         sr, sc = action.coord.r, action.coord.c
@@ -263,8 +294,8 @@ def _move_score(grid, sr, sc, nr, nc, is_red):
     # Centre proximity as a small tiebreaker; range ~0..0.7.
     score = 0.1 * (7 - abs(nr - 3.5) - abs(nc - 3.5))
 
-    # Tier 3.5: explicit penalty for moving onto an edge cell — pieces
-    # there have ≤3 escape directions and are easier to corner.
+    # Explicit penalty for moving onto an edge cell — pieces there have ≤3
+    # escape directions and are easier to corner.
     if nr == 0 or nr == 7 or nc == 0 or nc == 7:
         score -= 0.3
 

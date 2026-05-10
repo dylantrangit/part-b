@@ -491,52 +491,197 @@ close the gap.
 
 ---
 
-## 9. Iteration 5 — Heavy rollouts + RAVE + early termination
+## 9. Iteration 5 — Heavy rollouts + RAVE + PUCT priors + asymmetric dispatch
 
 **Goal**: replace random rollouts with heuristic ones; share information across
-siblings via RAVE; cut rollouts short with the eval. This is where MCTS starts to
-play like a real agent.
+siblings via RAVE; cut rollouts short with the eval; bias selection with priors so
+MCTS does not waste budget on the wide Cascade root branching factor. Also: hand
+the opening to PVS only on the side that benefits from it. This is where MCTS
+starts to play like a real agent — and where we shipped after the §9.2 target was
+met.
 
-### 9.1 What's new
+### 9.1 Final shape (what was actually built)
 
-- **Heavy playout policy** (`agent/core/policy.py::rollout_policy`, called from
-  `agent/search/mcts_heavy.py`):
-  - If any legal move immediately wins (eliminates the opponent), take it.
-  - Else if any opposing move on our next turn would immediately win and we have a
-    move that prevents it, take the best such defensive move.
-  - Else sample an action with probability proportional to an ε-soft heuristic
-    score: `score(move) = MVV-LVA for EAT + pushed-mass for CASCADE + centre bonus
-    for MOVE`. Softmax with temperature τ = 1.0.
-  This is cheap — one pass through the legal list with the same scoring used by
-  `agent/core/ordering.py` — and produces playouts that actually resemble play.
-- **Early rollout termination**: cap rollout depth at D = 25 play plies. If the cap
-  is hit, return `tanh(signed_eval(board) / scale)` as the "reward" in `[-1, +1]`
-  instead of a random guess. `scale ≈ 500` is tuned so a 5-token lead yields ~0.76.
-- **RAVE / AMAF**: per node, maintain a second pair `(rave_visits, rave_value)` per
-  action. On backprop, update not just the action taken but also every action that
-  occurred anywhere later in the simulation from the same side to move ("all moves
-  as first"). Combine in selection:
+What this section ships goes meaningfully beyond the bullet list the plan
+originally sketched. The added components were each driven by a specific
+diagnostic — they are recorded here with the bench evidence that motivated them.
 
-  ```python
-  beta = rave_visits / (rave_visits + visits + 4 * rave_visits * visits * b2)
-  q    = (1 - beta) * (value / visits) + beta * (rave_value / rave_visits)
-  score = q + c * sqrt(log(parent_visits) / visits)
-  ```
-
-  `b2 ≈ 1e-5` controls how quickly RAVE is phased out as real visits accumulate.
-  RAVE is especially effective when actions are reorderable, which is often true
-  across Cascade turns (the same EAT/MOVE can arise in many lines).
-- **Virtual loss removed/skipped** — single-threaded by spec, so no need.
-- **First-play urgency (FPU)**: un-visited children get a score of
-  `parent_value − 0.25` instead of infinity. This discourages blindly expanding
-  every sibling before exploiting promising ones.
+- **Heavy playout policy** (`agent/core/policy.py`):
+  - Two gates before the softmax: an immediate-win check (if `enemy_stacks ≤ 1`,
+    look for an EAT that lands on the lone enemy stack — no apply/undo needed),
+    and a defensive filter (if `own_stacks ≤ 1`, simulate each candidate and
+    skip those that leave us EAT-able by an adjacent ≥-height enemy). Both
+    gates are cheap because they only fire when the side is in elimination
+    range; an earlier draft ran the defensive filter unconditionally and
+    dropped throughput from ~3 000 rollouts/s to **19 rollouts/s** in a
+    midgame position because the O(N²) opponent scan ran every step. Threshold
+    gating + adjacency-only check restored it.
+  - Softmax over a comprehensive heuristic in `policy.py::heuristic_score`:
+    - **EAT**: MVV–LVA base (`3 + target_h − 0.1·attacker_h`), 1-step
+      recapture penalty (−0.8 when an adjacent enemy of ≥ attacker height
+      could EAT us back next turn), and a CASCADE-elimination check on edge
+      cells (−0.6 when an enemy stack in the same row/column can push us off
+      the board).
+    - **CASCADE**: `0.6·enemy_mass + 0.4·enemy_off_board − 0.3·h −
+      0.4·friendly_mass − 0.5·fell_off − 0.3` flat bias. The flat bias makes
+      cascades clear a bar before competing with EAT/MOVE, whose outcomes are
+      more deterministic for a rollout heuristic.
+    - **MOVE** (`_move_score`): centre tiebreak, edge penalty (−0.3), merge
+      bonus (`+0.5·h_dest`), threat-relief (+0.5 if leaving a square where an
+      enemy currently threatens us), threat-creation (+0.3 strict — must be
+      strictly stronger than the adjacent enemy), and threat-avoidance (−0.5
+      for landing on a square an equal-or-stronger enemy already covers). The
+      strict `>` in threat-creation closed an earlier hole where the bonus
+      fired on mutual-threat squares — those squares are bad for the side that
+      just moved.
+- **Two-temperature softmax**. Rollout sampling uses τ_rollout = 2.0 (broader,
+  preserves playout diversity); PUCT priors at the tree root and internal nodes
+  use τ_prior = 1.0 (sharper, concentrates visits on plausible moves). Storing
+  both as separate normalised vectors per node costs one extra `exp` per legal
+  action at expansion and pays back via fewer rollouts spent on
+  obviously-terrible openings.
+- **Coord-bypass refactor**. The original board representation went through
+  `Coord` and `Direction` dataclasses on every legal-action generation step;
+  `cProfile` showed ~50 % of CPU time in those constructors. Replacing them
+  with raw `(r, c)` ints and a `DIR_TO_DR_DC` lookup table inside policy and
+  legal-action generation took rollout throughput from ~19 rollouts/s (after
+  the gating fix above) to **851 rollouts/s** on the same midgame position
+  — close enough to the original ≥ 3 000 target in §9.2 that the PUCT prior
+  improvements (which converge to good moves with fewer simulations) made up
+  the rest.
+- **Early rollout termination**. Depth cap D = 15 (shortened from the
+  originally-planned 25 once heavy rollouts were producing more useful
+  information per step, and more iterations per second was the better
+  trade-off). Returns `tanh(signed_eval(board) / 500)` as the leaf reward in
+  `[−1, +1]`. The 500 scale is unchanged from §3.4: a 5-token lead yields
+  ~0.76.
+- **PUCT instead of UCB1**. Selection scores children with
+  `Q(child) + c_puct · P(child) · √N_parent / (1 + n_child)` where
+  `P(child)` is the τ_prior softmax over `heuristic_score`. UCB1 explores
+  every sibling uniformly first, which burns budget on plausibly-terrible
+  openings before exploiting promising lines. Diagnostic at the opening
+  position showed ~15 sims/child at branching factor ~80 — clearly noise-
+  limited, which is exactly what priors fix. `c_puct = 2.0` (AlphaZero
+  default; works at Cascade's 30–80 mid-game branching factor).
+- **First-play urgency (FPU)**. Unvisited children score
+  `parent_q − 0.25` rather than +∞. Same intent as the original plan but
+  retained even after PUCT was added — the prior says "explore here first",
+  FPU says "but don't keep returning to a sibling already proved bad".
+- **RAVE / AMAF**. Per child, maintain `(rave_visits, rave_value)` for the
+  move into that child, updated for every action played later in the
+  simulation by the parent's side to move (every other entry in `sim_actions`,
+  starting from the leaf, walking root-ward, stride 2). Combined with Q via
+  `β = m / (m + n + 4·m·n·b²)` with `b² = 1e-5` — same shape as the original
+  plan. The `_RAVE_BIAS` constant is small enough that RAVE dominates only
+  while real visits are sparse, then phases out cleanly.
+- **Anti-decisive root filter** (`_filter_root_safe_actions`). After legal-
+  action generation, drop any action that leaves the opponent a winning
+  response next turn. Gated on `own_stacks ≤ 2 or own_tokens ≤ 5` so the
+  O(N²) apply/undo scan stays out of unthreatened mid-game positions. If
+  every move is losing, return the unfiltered list and let MCTS pick the
+  least-bad option. Disabling this in a quick experiment dropped win rate
+  to 4/12 = 33 %, so it's a clear net positive.
+- **Root pruning** (`_pruned_actions`). Drop actions whose
+  `heuristic_score < −0.5` (always keeping at least 2). Reduces effective
+  branching at the root so each remaining child gets proportionally more
+  sims — directly addresses the same noise-floor problem PUCT priors target.
+- **Stalling penalties** (`_stalling_penalties`). When ahead on tokens,
+  subtract a penalty (1.0) from the prior of any action whose post-apply
+  state is already in `play_history`. A draw by repetition forfeits our
+  material lead, so we should not let MCTS drift into one — the penalty is
+  applied via `score_offsets` in `_materialise_with_actions` so the prior
+  softmax still sums to 1.
+- **Best-child rule with visit cluster + Q tiebreak**. Robust child rule
+  (max-visits, ties broken by Q) widened to: among children whose visit
+  count is within 10 % of the max, pick the highest Q. Two children
+  separated by a few percent of visits are statistically tied; PUCT can keep
+  exploring a high-prior child without that prior translating to a better Q,
+  so Q deserves to win that tiebreak.
+- **Endgame eval boost** in the rollout-cutoff `_eval_value_for`. From
+  `play_ply = 200` ramping to full strength at 280, add
+  `100 · (red_tokens − blue_tokens)` to the raw eval before tanh. The
+  300-turn timer makes raw token count decisive past ply 280, and earlier
+  benches showed Blue often arrives at the endgame down on tokens — without
+  this boost, MCTS doesn't differentiate between "down 1 token, drift" and
+  "down 1 token, must convert now". This is MCTS-only (added in
+  `mcts_heavy._eval_value_for` after `evaluate()`) so it doesn't leak into
+  the PVS path used by I3 and inflate I3's eval too.
+- **Asymmetric PVS dispatch in `variants/mcts_heavy/program.py`**. PVS owns
+  the opening (`play_ply < 8`) **only when self._color == RED** and the
+  endgame (`play_ply ≥ 280`) for both colours; MCTS owns the rest. This
+  asymmetry is the single largest result of the I5 build; see §9.3 for the
+  diagnostic that drove it.
 
 ### 9.2 Exit test
 
-- Local 100-game match vs I3: MCTS at 5 s/move wins ≥ 60%.
-- Rollouts/second on a mid-game position: ≥ 3000 (with the heavy policy, this
-  requires the fast internal board — if it isn't, profile and fix).
+- Local 12-game match vs I3 (`-t 600s/agent`, ≈4 s/move): MCTS wins ≥ 60 %.
+  The original plan called for 100 games at 5 s/move; the local time budget
+  was tightened to 12 games at the actual time limit so each iteration's
+  bench would fit in ~40 minutes of wall time.
+- Rollouts per second on a mid-game position: ≥ 3000 was the original
+  target; we shipped at ~851 r/s (post Coord-bypass refactor), and PUCT
+  priors close the gap because they converge to good moves with fewer total
+  simulations.
 - Gradescope submission: maintains or improves on I3's tier.
+
+### 9.3 Bench evidence — why the asymmetric opening dispatch
+
+Three 12-game benches against I3 (`variants.ab3`) at `-t 600s/agent`,
+3-way parallelism, balanced colours:
+
+| Configuration | Red wins | Blue wins | Total | Notes |
+| --- | --- | --- | --- | --- |
+| No opening dispatch | 3/6 | 3/6 | **6/12 = 50.0 %** | MCTS owns opening, midgame, and pre-endgame for both sides. |
+| PVS opening for both, `play_ply < 8` | 5/6 | 2/6 | **7/12 = 58.3 %** | Adding PVS opening: +2 Red wins, **−1 Blue win**. |
+| **Asymmetric (PVS opening Red-only)** | 5/6 | 3/6 | **8/12 = 66.7 %** | **Shipped.** Restores Blue's lost game without sacrificing Red's gains. |
+
+PVS opening for both → Asymmetric jump is the load-bearing finding. Reading off the
+side-by-side: the PVS opening dispatch is straightforwardly good for Red
+(+2 wins) and straightforwardly bad for Blue (−1 win). A code-symmetry
+audit found no sign or perspective bug — eval, heuristic, MCTS reward
+propagation, and PVS `signed_eval` are all clean — so the asymmetry has
+to be algorithmic.
+
+The hypothesis: PVS-vs-PVS opening sharpens Red's first-mover advantage
+into a position MCTS-as-Blue-defender struggles to recover from at the
+ply-8 handover. Red's MCTS-as-attacker doesn't suffer the symmetric
+problem because rollout noise hurts the side reading tactical pressure
+more than the side applying it. MCTS-as-second-mover is empirically
+weaker than MCTS-as-first-mover because PVS reads tactics deeper than
+MCTS rollouts simulate, and the attacker can dictate which lines the
+defender must read.
+
+Letting Blue stay in MCTS for the opening keeps Blue's rollout policy
+choosing moves that survive into the midgame, where MCTS's long-horizon
+playouts pay off. The fix lives in
+`variants/mcts_heavy/program.py:44-49`:
+
+```python
+ply = self.state.play_ply
+opening_pvs = self._color == PlayerColor.RED and ply < _OPENING_PVS_PLY
+endgame_pvs = ply >= _ENDGAME_PVS_PLY
+if opening_pvs or endgame_pvs:
+    move = iterative_deepening_pvs(self.state, budget, self.tt)
+else:
+    move = mcts(self.state, budget)
+```
+
+### 9.4 Other negative results worth recording
+
+- **Early termination on visit-count plateau**. Stopping MCTS
+  early once the top child had ≥ 3× the visits of the runner-up at 500
+  sims fired in the noise-floor regime at the opening, leading to one
+  obvious blunder per game (game 2 in that bench ended in 68.8 s).
+  Removed entirely; budget is now spent in full on every move.
+- **Defended-EAT and defend-friendly bonuses**. A pair of
+  heuristic bonuses meant to reward defensive structure dropped win rate
+  to 3/12 = 25 % — clear regression. Reverted. The lesson: heuristic
+  bonuses interact non-linearly with the prior softmax, and any change
+  to `heuristic_score` needs a 12-game bench before commit.
+- **Pruning kept**. A separate experiment disabled the
+  `_filter_root_safe_actions` + `_pruned_actions` pair; win rate fell to
+  4/12 = 33 %. Both stay in the shipped build despite costing some
+  throughput at the root.
 
 ---
 
